@@ -1,0 +1,81 @@
+name: Build macOS MPS wheels
+
+# Builds pyg-lib wheels for macOS / Apple Silicon (MPS) across a Python x PyTorch
+# matrix. On a version tag (v*), the built wheels are attached to the GitHub
+# Release. Compiled torch extensions are ABI-tied to the torch minor version, so
+# each wheel is tagged with a "+ptXYZ" local version (matching upstream's
+# data.pyg.org/whl convention).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+  pull_request:
+    paths: ['.github/workflows/build-macos-mps-wheels.yml']
+
+jobs:
+  build:
+    name: py${{ matrix.python }} · torch ${{ matrix.torch }}
+    runs-on: macos-14  # Apple Silicon (arm64) runner
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11', '3.12', '3.13']
+        torch: ['2.11.0', '2.12.1']
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only the two submodules the macOS (non-CUDA) build needs. METIS has a
+      # nested GKlib submodule, hence --recursive.
+      - name: Init submodules
+        run: |
+          git submodule update --init --recursive \
+            third_party/METIS third_party/parallel-hashmap
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch==${{ matrix.torch }}" setuptools wheel ninja
+
+      - name: Build wheel
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+          CMAKE_BUILD_PARALLEL_LEVEL: '3'
+        run: |
+          TORCH_TAG="pt$(echo '${{ matrix.torch }}' | cut -d. -f1,2 | tr -d .)"
+          echo "Building with version suffix +$TORCH_TAG"
+          PYG_LIB_VERSION_SUFFIX="+$TORCH_TAG" python setup.py bdist_wheel
+
+      # Runners are headless; import-only smoke test (no MPS GPU assertion).
+      - name: Smoke test (import)
+        run: |
+          pip install dist/*.whl
+          python -c "import pyg_lib, pyg_lib.ops; print('pyg_lib', pyg_lib.__version__, 'imported OK')"
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-py${{ matrix.python }}-torch${{ matrix.torch }}
+          path: dist/*.whl
+
+  release:
+    name: Attach wheels to release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+          fail_on_unmatched_files: true
