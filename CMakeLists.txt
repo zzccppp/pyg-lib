@@ -97,6 +97,14 @@ file(GLOB_RECURSE ALL_SOURCES ${CSRC}/*.cpp)
 if (WITH_CUDA)
   file(GLOB_RECURSE ALL_SOURCES ${ALL_SOURCES} ${CSRC}/*.cu)
 endif()
+# On macOS, compile the Objective-C++ Metal kernels (mps/*.mm) into the library.
+if (APPLE)
+  enable_language(OBJCXX)
+  set(CMAKE_OBJCXX_STANDARD 20)
+  set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+  file(GLOB_RECURSE MM_SOURCES ${CSRC}/*.mm)
+  list(APPEND ALL_SOURCES ${MM_SOURCES})
+endif()
 add_library(${PROJECT_NAME} SHARED ${ALL_SOURCES})
 target_include_directories(${PROJECT_NAME} PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 if(MKL_INCLUDE_FOUND)
@@ -155,6 +163,12 @@ if (MSVC)
 endif()
 message("-- TORCH_LIBRARIES: ${TORCH_LIBRARIES}")
 target_link_libraries(${PROJECT_NAME} PRIVATE ${TORCH_LIBRARIES})
+
+# Link the frameworks used by the Objective-C++ Metal kernels on macOS.
+if (APPLE)
+  target_link_libraries(${PROJECT_NAME} PRIVATE
+    "-framework Metal" "-framework Foundation")
+endif()
 
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)

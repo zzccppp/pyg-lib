@@ -1,0 +1,141 @@
+#include "../scatter.h"
+
+#include <ATen/ATen.h>
+#include <torch/library.h>
+
+#include <limits>
+#include <tuple>
+
+namespace pyg {
+namespace ops {
+namespace {
+
+int64_t normalize_dim(int64_t dim, int64_t rank, const char* name) {
+  dim = dim < 0 ? rank + dim : dim;
+  TORCH_CHECK(dim >= 0 && dim < rank, name, ": dim out of range");
+  return dim;
+}
+
+void check_scatter_inputs(const char* name,
+                          const at::Tensor& src,
+                          const at::Tensor& index) {
+  TORCH_CHECK(src.device().is_mps(), name, ": src must be an MPS tensor");
+  TORCH_CHECK(index.device().is_mps(),
+              name, ": index must be an MPS tensor");
+  TORCH_CHECK(src.device() == index.device(),
+              name, ": src and index must be on the same device");
+  TORCH_CHECK(src.dim() == index.dim(),
+              name, ": src.dim() must equal index.dim() "
+              "after broadcasting (got src.dim()=",
+              src.dim(), ", index.dim()=", index.dim(), ")");
+}
+
+std::vector<int64_t> output_sizes(const char* name,
+                                  const at::Tensor& src,
+                                  const at::Tensor& index,
+                                  int64_t dim,
+                                  std::optional<int64_t> dim_size) {
+  auto sizes = src.sizes().vec();
+  if (dim_size.has_value()) {
+    TORCH_CHECK(dim_size.value() >= 0, name,
+                ": dim_size must be non-negative");
+    sizes[dim] = dim_size.value();
+  } else if (index.numel() == 0) {
+    sizes[dim] = 0;
+  } else {
+    sizes[dim] = 1 + index.max().item<int64_t>();
+  }
+  return sizes;
+}
+
+void check_optional_out(const char* name,
+                        const at::Tensor& src,
+                        const at::Tensor& out,
+                        int64_t dim) {
+  TORCH_CHECK(out.device() == src.device(), name,
+              ": src and out must be on the same device");
+  TORCH_CHECK(out.dim() == src.dim(), name,
+              ": out.dim() must equal src.dim() (got out.dim()=", out.dim(),
+              ", src.dim()=", src.dim(), ")");
+  for (int64_t i = 0; i < out.dim(); ++i) {
+    if (i != dim) {
+      TORCH_CHECK(src.size(i) == out.size(i), name, ": out.size(", i,
+                  ") must match src.size(", i, ")");
+    }
+  }
+}
+
+at::Tensor scatter_sum_mps(const at::Tensor& src,
+                           const at::Tensor& index,
+                           int64_t dim,
+                           const std::optional<at::Tensor>& optional_out,
+                           std::optional<int64_t> dim_size) {
+  check_scatter_inputs("scatter_sum", src, index);
+
+  dim = normalize_dim(dim, src.dim(), "scatter_sum");
+
+  auto src_c = src.contiguous();
+  auto index_c = index.contiguous();
+
+  at::Tensor out;
+  if (optional_out.has_value()) {
+    const auto& optional = optional_out.value();
+    check_optional_out("scatter_sum", src_c, optional, dim);
+    out = optional.contiguous();
+  } else {
+    auto sizes = output_sizes("scatter_sum", src_c, index_c, dim, dim_size);
+    out = at::zeros(sizes, src_c.options());
+  }
+
+  if (src_c.numel() == 0) {
+    return out;
+  }
+
+  out.scatter_add_(dim, index_c, src_c);
+  return out;
+}
+
+at::Tensor scatter_mul_mps(const at::Tensor& src,
+                           const at::Tensor& index,
+                           int64_t dim,
+                           const std::optional<at::Tensor>& optional_out,
+                           std::optional<int64_t> dim_size) {
+  check_scatter_inputs("scatter_mul", src, index);
+
+  dim = normalize_dim(dim, src.dim(), "scatter_mul");
+
+  auto src_c = src.contiguous();
+  auto index_c = index.contiguous();
+
+  at::Tensor out;
+  if (optional_out.has_value()) {
+    const auto& optional = optional_out.value();
+    check_optional_out("scatter_mul", src_c, optional, dim);
+    out = optional.contiguous();
+  } else {
+    auto sizes = output_sizes("scatter_mul", src_c, index_c, dim, dim_size);
+    out = at::ones(sizes, src_c.options());
+  }
+
+  if (src_c.numel() == 0) {
+    return out;
+  }
+
+  out.scatter_reduce_(dim, index_c, src_c, "prod", true);
+  return out;
+}
+
+}  // namespace
+
+// scatter_min / scatter_max are registered for MPS in mps/scatter_metal.mm,
+// which provides a fused single-pass Metal kernel (value + arg) with an int32
+// tensor-op fallback for shapes/dtypes outside the hot path.
+TORCH_LIBRARY_IMPL(pyg, MPS, m) {
+  m.impl(TORCH_SELECTIVE_NAME("pyg::scatter_sum"),
+         TORCH_FN(scatter_sum_mps));
+  m.impl(TORCH_SELECTIVE_NAME("pyg::scatter_mul"),
+         TORCH_FN(scatter_mul_mps));
+}
+
+}  // namespace ops
+}  // namespace pyg

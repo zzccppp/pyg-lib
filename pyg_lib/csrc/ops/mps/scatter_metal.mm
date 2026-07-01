@@ -1,0 +1,502 @@
+// Fused single-pass scatter_min / scatter_max for the MPS backend.
+//
+// The tensor-op MPS path computes the reduced value and its arg index with five
+// generic kernels (scatter_reduce, gather, eq, where, scatter_reduce). This file
+// replaces that with a hand-written Metal kernel that computes value *and* arg
+// in a single atomic pass over the source.
+//
+// Key idea: pack an order-preserving uint transform of the float value in the
+// high 32 bits and the (bit-complemented) source position in the low 32 bits of
+// a 64-bit word, then `atomic_max` per output cell. A larger value wins; on a
+// tie, the complemented position makes the *smallest* source index win, which
+// matches the CPU kernel's first-match semantics. A cheap second kernel unpacks
+// the 64-bit keys into the value and arg tensors.
+//
+// This requires 64-bit atomics (Metal 3.1+, Apple GPU family 8/9). The kernel
+// handles an arbitrary `dim` and rank by viewing `src` as [OUTER, D, INNER], and
+// both a broadcast index (from a 1-D edge index) and a genuine per-element index,
+// for float32/float16/bfloat16. Only a caller-provided `out` (include_self) and
+// tensors too large for the 32-bit counters fall back to the int32 tensor path.
+
+#include "../scatter.h"
+
+#include <ATen/ATen.h>
+#include <torch/library.h>
+
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+#include <torch/mps.h>
+
+#include <limits>
+#include <optional>
+#include <tuple>
+#include <vector>
+
+namespace pyg {
+namespace ops {
+namespace {
+
+// ---------------------------------------------------------------------------
+// Shared shape helpers (kept local; mirror mps/scatter_kernel.cpp).
+// ---------------------------------------------------------------------------
+
+int64_t normalize_dim(int64_t dim, int64_t rank, const char* name) {
+  dim = dim < 0 ? rank + dim : dim;
+  TORCH_CHECK(dim >= 0 && dim < rank, name, ": dim out of range");
+  return dim;
+}
+
+void check_scatter_inputs(const char* name,
+                          const at::Tensor& src,
+                          const at::Tensor& index) {
+  TORCH_CHECK(src.device().is_mps(), name, ": src must be an MPS tensor");
+  TORCH_CHECK(index.device().is_mps(), name, ": index must be an MPS tensor");
+  TORCH_CHECK(src.device() == index.device(),
+              name, ": src and index must be on the same device");
+  TORCH_CHECK(src.dim() == index.dim(),
+              name, ": src.dim() must equal index.dim() after broadcasting");
+}
+
+std::vector<int64_t> output_sizes(const char* name,
+                                  const at::Tensor& src,
+                                  const at::Tensor& index,
+                                  int64_t dim,
+                                  std::optional<int64_t> dim_size) {
+  auto sizes = src.sizes().vec();
+  if (dim_size.has_value()) {
+    TORCH_CHECK(dim_size.value() >= 0, name, ": dim_size must be non-negative");
+    sizes[dim] = dim_size.value();
+  } else if (index.numel() == 0) {
+    sizes[dim] = 0;
+  } else {
+    sizes[dim] = 1 + index.max().item<int64_t>();
+  }
+  return sizes;
+}
+
+void check_optional_out(const char* name,
+                        const at::Tensor& src,
+                        const at::Tensor& out,
+                        int64_t dim) {
+  TORCH_CHECK(out.device() == src.device(), name,
+              ": src and out must be on the same device");
+  TORCH_CHECK(out.dim() == src.dim(), name,
+              ": out.dim() must equal src.dim()");
+  for (int64_t i = 0; i < out.dim(); ++i) {
+    if (i != dim) {
+      TORCH_CHECK(src.size(i) == out.size(i), name, ": out.size(", i,
+                  ") must match src.size(", i, ")");
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Metal shader: fused pack + unpack for both min and max (is_min switches).
+// ---------------------------------------------------------------------------
+
+static const char* kShaderSrc = R"METAL(
+#include <metal_stdlib>
+using namespace metal;
+
+// Order-preserving float -> uint transform (monotonic for non-NaN floats).
+inline uint f2s(float f) {
+    uint u = as_type<uint>(f);
+    uint mask = (u >> 31) ? 0xFFFFFFFFu : 0x80000000u;
+    return u ^ mask;
+}
+inline float s2f(uint s) {
+    uint mask = (s >> 31) ? 0x80000000u : 0xFFFFFFFFu;
+    return as_type<float>(s ^ mask);
+}
+
+// Promote a source element to float32. bfloat16 is carried as its raw 16-bit
+// pattern (the high half of a float32), so we do not depend on Metal's bfloat.
+inline float to_float(float v)  { return v; }
+inline float to_float(half v)   { return float(v); }
+inline float to_float(ushort v) { return as_type<float>(uint(v) << 16); }
+
+// Store a float32 result into the output element's native dtype. The value came
+// from an actual source element, so these narrowing conversions are exact.
+inline void store_out(device float* p, uint i, float v)  { p[i] = v; }
+inline void store_out(device half* p, uint i, float v)   { p[i] = half(v); }
+inline void store_out(device ushort* p, uint i, float v) { p[i] = ushort(as_type<uint>(v) >> 16); }
+
+// General scatter along an arbitrary dim, viewing src as [OUTER, D, INNER]
+// (OUTER = product of dims before dim, D = size along dim, INNER = product of
+// dims after dim). Output is [OUTER, DIMSZ, INNER]. For element gid with
+// coordinates (o, k, j), the target cell is (o*DIMSZ + n)*INNER + j where n is
+// the scatter index; the arg index recorded is k (the position along dim).
+// `idx_mode` 0 reads a length-D broadcast index (idx[k]); mode 1 reads a full
+// per-element index (idx[gid]). Pack the sortable value with ~k and atomic_max;
+// for min we store ~f2s so the smallest value yields the largest key.
+template <typename T>
+inline void pack_impl(device const T* src, device const long* idx,
+                      device atomic_ulong* keys, uint OUTER, uint D, uint INNER,
+                      uint DIMSZ, uint is_min, uint idx_mode, uint gid) {
+    if (gid >= OUTER * D * INNER) return;
+    uint dinner = D * INNER;
+    uint o = gid / dinner;
+    uint rem = gid % dinner;
+    uint k = rem / INNER;
+    uint j = rem % INNER;
+    long n = (idx_mode == 0u) ? idx[k] : idx[gid];
+    uint vt = f2s(to_float(src[gid]));
+    if (is_min != 0u) vt = ~vt;
+    ulong packed = ((ulong)vt << 32) | (ulong)(~k);
+    uint cell = (o * DIMSZ + (uint)n) * INNER + j;
+    atomic_max_explicit(&keys[cell], packed, memory_order_relaxed);
+}
+
+// Unpack keys -> value + arg. Empty cells (key high bits == 0) become value 0
+// and arg D (the sentinel src.size(dim)).
+template <typename OutT>
+inline void unpack_impl(device const ulong* keys, device OutT* out,
+                        device long* arg, uint NF, uint D, uint is_min,
+                        uint gid) {
+    if (gid >= NF) return;
+    ulong key = keys[gid];
+    uint vt = (uint)(key >> 32);
+    if (vt == 0u) { store_out(out, gid, 0.0f); arg[gid] = (long)D; return; }
+    uint s = (is_min != 0u) ? ~vt : vt;
+    store_out(out, gid, s2f(s));
+    arg[gid] = (long)(~((uint)(key & 0xFFFFFFFFu)));
+}
+
+#define PACK_KERNEL(NAME, T)                                \
+  kernel void NAME(device const T* src [[buffer(0)]],       \
+                   device const long* idx [[buffer(1)]],    \
+                   device atomic_ulong* keys [[buffer(2)]], \
+                   constant uint& OUTER [[buffer(3)]],       \
+                   constant uint& D [[buffer(4)]],           \
+                   constant uint& INNER [[buffer(5)]],       \
+                   constant uint& DIMSZ [[buffer(6)]],       \
+                   constant uint& is_min [[buffer(7)]],      \
+                   constant uint& idx_mode [[buffer(8)]],    \
+                   uint gid [[thread_position_in_grid]]) {   \
+    pack_impl(src, idx, keys, OUTER, D, INNER, DIMSZ, is_min, idx_mode, gid); \
+  }
+#define UNPACK_KERNEL(NAME, T)                              \
+  kernel void NAME(device const ulong* keys [[buffer(0)]], \
+                   device T* out [[buffer(1)]],             \
+                   device long* arg [[buffer(2)]],          \
+                   constant uint& NF [[buffer(3)]],          \
+                   constant uint& D [[buffer(4)]],           \
+                   constant uint& is_min [[buffer(5)]],      \
+                   uint gid [[thread_position_in_grid]]) {   \
+    unpack_impl(keys, out, arg, NF, D, is_min, gid);         \
+  }
+
+PACK_KERNEL(scatter_pack_f32, float)
+PACK_KERNEL(scatter_pack_f16, half)
+PACK_KERNEL(scatter_pack_bf16, ushort)
+UNPACK_KERNEL(scatter_unpack_f32, float)
+UNPACK_KERNEL(scatter_unpack_f16, half)
+UNPACK_KERNEL(scatter_unpack_bf16, ushort)
+)METAL";
+
+// Pipelines indexed by dtype: 0 = float32, 1 = float16, 2 = bfloat16.
+constexpr int kNumDtypes = 3;
+
+struct MetalScatter {
+  id<MTLDevice> device = nil;
+  id<MTLComputePipelineState> pack[kNumDtypes] = {nil, nil, nil};
+  id<MTLComputePipelineState> unpack[kNumDtypes] = {nil, nil, nil};
+  bool ok = false;
+};
+
+id<MTLComputePipelineState> make_pso(id<MTLDevice> dev,
+                                     id<MTLLibrary> lib,
+                                     NSString* name) {
+  NSError* err = nil;
+  id<MTLFunction> fn = [lib newFunctionWithName:name];
+  if (!fn) return nil;
+  return [dev newComputePipelineStateWithFunction:fn error:&err];
+}
+
+// Compiled once (thread-safe function-local static). If 64-bit atomics or the
+// Metal toolchain are unavailable, `ok` stays false and callers fall back.
+const MetalScatter& metal_scatter() {
+  static MetalScatter state = [] {
+    MetalScatter s;
+    @autoreleasepool {
+      id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+      if (!dev) return s;
+      NSError* err = nil;
+      id<MTLLibrary> lib = [dev
+          newLibraryWithSource:[NSString stringWithUTF8String:kShaderSrc]
+                       options:nil
+                         error:&err];
+      if (!lib) return s;
+      NSString* pack_names[kNumDtypes] = {
+          @"scatter_pack_f32", @"scatter_pack_f16", @"scatter_pack_bf16"};
+      NSString* unpack_names[kNumDtypes] = {
+          @"scatter_unpack_f32", @"scatter_unpack_f16", @"scatter_unpack_bf16"};
+      for (int i = 0; i < kNumDtypes; ++i) {
+        s.pack[i] = make_pso(dev, lib, pack_names[i]);
+        s.unpack[i] = make_pso(dev, lib, unpack_names[i]);
+        if (!s.pack[i] || !s.unpack[i]) return s;
+      }
+      s.device = dev;
+      s.ok = true;
+    }
+    return s;
+  }();
+  return state;
+}
+
+// Map a supported float dtype to its pipeline index, or -1 if unsupported.
+int metal_dtype_index(at::ScalarType dtype) {
+  switch (dtype) {
+    case at::kFloat: return 0;
+    case at::kHalf: return 1;
+    case at::kBFloat16: return 2;
+    default: return -1;
+  }
+}
+
+static inline id<MTLBuffer> mtl_buffer(const at::Tensor& t) {
+  return __builtin_bit_cast(id<MTLBuffer>, t.storage().data());
+}
+
+static inline NSUInteger byte_offset(const at::Tensor& t) {
+  return (NSUInteger)(t.storage_offset() * t.element_size());
+}
+
+// Extract the length-D index vector from a fully stride-0-broadcast index
+// (an index that varies only along `dim`). Returns a contiguous [D] tensor.
+at::Tensor broadcast_index_vector(const at::Tensor& index, int64_t dim) {
+  auto v = index.movedim(dim, 0);
+  while (v.dim() > 1) {
+    v = v.select(1, 0);
+  }
+  return v.contiguous();
+}
+
+// Fused Metal path for a general `dim`. Views src as [OUTER, D, INNER] and
+// scatters into out [OUTER, DIMSZ, INNER]. Preconditions (checked by caller):
+// src dtype in {f32,f16,bf16}, no `out` provided, index dtype long with
+// index.sizes() == src.sizes(), and the size guards in `metal_eligible` hold.
+std::tuple<at::Tensor, at::Tensor> scatter_metal_general(const at::Tensor& src,
+                                                         const at::Tensor& index,
+                                                         int64_t dim,
+                                                         int64_t dim_size,
+                                                         uint32_t is_min,
+                                                         int dtype_idx) {
+  const MetalScatter& m = metal_scatter();
+  id<MTLComputePipelineState> pack_pso = m.pack[dtype_idx];
+  id<MTLComputePipelineState> unpack_pso = m.unpack[dtype_idx];
+  auto src_c = src.contiguous();
+
+  const int64_t D = src_c.size(dim);
+  int64_t outer64 = 1, inner64 = 1;
+  for (int64_t i = 0; i < dim; ++i) outer64 *= src_c.size(i);
+  for (int64_t i = dim + 1; i < src_c.dim(); ++i) inner64 *= src_c.size(i);
+
+  // Broadcast index (varies only along `dim`) -> length-D vector; otherwise use
+  // the full per-element index. Detect via strides being 0 on all other dims.
+  bool broadcast = true;
+  for (int64_t i = 0; i < index.dim(); ++i) {
+    if (i != dim && index.stride(i) != 0) { broadcast = false; break; }
+  }
+  at::Tensor idx_buf =
+      broadcast ? broadcast_index_vector(index, dim) : index.contiguous();
+  const uint32_t idx_mode = broadcast ? 0u : 1u;
+
+  auto out_sizes = src_c.sizes().vec();
+  out_sizes[dim] = dim_size;
+  auto keys = at::zeros(out_sizes, src_c.options().dtype(at::kLong));
+  auto out = at::empty(out_sizes, src_c.options());
+  auto arg = at::empty(out_sizes, src_c.options().dtype(at::kLong));
+
+  const uint32_t OUTER = (uint32_t)outer64;
+  const uint32_t Du = (uint32_t)D;
+  const uint32_t INNER = (uint32_t)inner64;
+  const uint32_t DIMSZ = (uint32_t)dim_size;
+  const uint32_t total = (uint32_t)(outer64 * D * inner64);
+  const uint32_t NF = (uint32_t)(outer64 * dim_size * inner64);
+
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = torch::mps::get_command_buffer();
+    dispatch_queue_t q = torch::mps::get_dispatch_queue();
+    dispatch_sync(q, ^{
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+      [enc setComputePipelineState:pack_pso];
+      [enc setBuffer:mtl_buffer(src_c) offset:byte_offset(src_c) atIndex:0];
+      [enc setBuffer:mtl_buffer(idx_buf) offset:byte_offset(idx_buf) atIndex:1];
+      [enc setBuffer:mtl_buffer(keys) offset:0 atIndex:2];
+      [enc setBytes:&OUTER length:sizeof(OUTER) atIndex:3];
+      [enc setBytes:&Du length:sizeof(Du) atIndex:4];
+      [enc setBytes:&INNER length:sizeof(INNER) atIndex:5];
+      [enc setBytes:&DIMSZ length:sizeof(DIMSZ) atIndex:6];
+      [enc setBytes:&is_min length:sizeof(is_min) atIndex:7];
+      [enc setBytes:&idx_mode length:sizeof(idx_mode) atIndex:8];
+      NSUInteger tg_pack =
+          MIN((NSUInteger)pack_pso.maxTotalThreadsPerThreadgroup, (NSUInteger)total);
+      [enc dispatchThreads:MTLSizeMake(total, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(MAX(tg_pack, (NSUInteger)1), 1, 1)];
+
+      [enc setComputePipelineState:unpack_pso];
+      [enc setBuffer:mtl_buffer(keys) offset:0 atIndex:0];
+      [enc setBuffer:mtl_buffer(out) offset:0 atIndex:1];
+      [enc setBuffer:mtl_buffer(arg) offset:0 atIndex:2];
+      [enc setBytes:&NF length:sizeof(NF) atIndex:3];
+      [enc setBytes:&Du length:sizeof(Du) atIndex:4];
+      [enc setBytes:&is_min length:sizeof(is_min) atIndex:5];
+      NSUInteger tg_un =
+          MIN((NSUInteger)unpack_pso.maxTotalThreadsPerThreadgroup, (NSUInteger)NF);
+      [enc dispatchThreads:MTLSizeMake(NF, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(MAX(tg_un, (NSUInteger)1), 1, 1)];
+
+      [enc endEncoding];
+      torch::mps::commit();
+    });
+  }
+  return std::make_tuple(out, arg);
+}
+
+// ---------------------------------------------------------------------------
+// Portable fallback: int32 arg reduction with tensor ops (all shapes/dtypes).
+// ---------------------------------------------------------------------------
+
+template <typename Fill>
+std::tuple<at::Tensor, at::Tensor> scatter_minmax_fallback(
+    const char* name,
+    const char* reduce,
+    const at::Tensor& src,
+    const at::Tensor& index,
+    int64_t dim,
+    const std::optional<at::Tensor>& optional_out,
+    std::optional<int64_t> dim_size,
+    Fill fill) {
+  auto src_c = src.contiguous();
+  auto index_c = index.contiguous();
+  const int64_t dim_len = src_c.size(dim);
+  TORCH_CHECK(
+      dim_len <= static_cast<int64_t>(std::numeric_limits<int32_t>::max()),
+      name, ": src.size(dim) exceeds the int32 range required by the MPS "
+      "arg path");
+  const int32_t sentinel = static_cast<int32_t>(dim_len);
+
+  at::Tensor out;
+  const bool out_was_provided = optional_out.has_value();
+  if (out_was_provided) {
+    const auto& optional = optional_out.value();
+    check_optional_out(name, src_c, optional, dim);
+    out = optional.contiguous();
+  } else {
+    auto sizes = output_sizes(name, src_c, index_c, dim, dim_size);
+    out = at::empty(sizes, src_c.options());
+    fill(out);
+  }
+
+  auto arg_out =
+      at::full(out.sizes(), sentinel, index_c.options().dtype(at::kInt));
+
+  if (src_c.numel() == 0) {
+    if (!out_was_provided) {
+      out.zero_();
+    }
+    return std::make_tuple(out, arg_out.to(at::kLong));
+  }
+
+  out.scatter_reduce_(dim, index_c, src_c, reduce, true);
+
+  auto gathered = out.gather(dim, index_c);
+  auto position_sizes = std::vector<int64_t>(src_c.dim(), 1);
+  position_sizes[dim] = dim_len;
+  auto positions = at::arange(dim_len, index_c.options().dtype(at::kInt))
+                       .reshape(position_sizes)
+                       .expand_as(index_c);
+  auto candidates = at::where(src_c.eq(gathered), positions,
+                              at::full_like(positions, sentinel));
+  arg_out.scatter_reduce_(dim, index_c, candidates, "amin", true);
+
+  if (!out_was_provided) {
+    out.masked_fill_(arg_out == sentinel, 0);
+  }
+
+  return std::make_tuple(out, arg_out.to(at::kLong));
+}
+
+// Run the fused Metal path if this call is eligible; return nullopt otherwise.
+// Eligible when: pipelines built, no `out` provided, src dtype in {f32,f16,bf16},
+// index is int64 broadcast to src.shape, and the sizes fit the kernel's 32-bit
+// counters (positions < 2^31, source and output element counts < 2^32).
+std::optional<std::tuple<at::Tensor, at::Tensor>> maybe_scatter_metal(
+    const char* name,
+    const at::Tensor& src,
+    const at::Tensor& index,
+    int64_t dim,
+    const std::optional<at::Tensor>& optional_out,
+    std::optional<int64_t> dim_size,
+    uint32_t is_min) {
+  const int dtype_idx = metal_dtype_index(src.scalar_type());
+  if (!metal_scatter().ok || optional_out.has_value() || dtype_idx < 0 ||
+      index.scalar_type() != at::kLong || index.sizes() != src.sizes()) {
+    return std::nullopt;
+  }
+  auto sizes = output_sizes(name, src, index, dim, dim_size);
+  int64_t out_numel = 1;
+  for (auto s : sizes) out_numel *= s;
+  const int64_t i32_max = std::numeric_limits<int32_t>::max();
+  const int64_t u32_max = std::numeric_limits<uint32_t>::max();
+  if (src.size(dim) > i32_max || src.numel() > u32_max || out_numel > u32_max) {
+    return std::nullopt;
+  }
+  return scatter_metal_general(src, index, dim, sizes[dim], is_min, dtype_idx);
+}
+
+std::tuple<at::Tensor, at::Tensor> scatter_min_mps(
+    const at::Tensor& src,
+    const at::Tensor& index,
+    int64_t dim,
+    const std::optional<at::Tensor>& optional_out,
+    std::optional<int64_t> dim_size) {
+  check_scatter_inputs("scatter_min", src, index);
+  dim = normalize_dim(dim, src.dim(), "scatter_min");
+  if (auto r = maybe_scatter_metal("scatter_min", src, index, dim, optional_out,
+                                   dim_size, /*is_min=*/1u)) {
+    return *r;
+  }
+  return scatter_minmax_fallback(
+      "scatter_min", "amin", src, index, dim, optional_out, dim_size,
+      [&](at::Tensor& out) {
+        AT_DISPATCH_ALL_TYPES_AND2(
+            at::ScalarType::Half, at::ScalarType::BFloat16, out.scalar_type(),
+            "scatter_min_mps_init",
+            [&] { out.fill_(std::numeric_limits<scalar_t>::max()); });
+      });
+}
+
+std::tuple<at::Tensor, at::Tensor> scatter_max_mps(
+    const at::Tensor& src,
+    const at::Tensor& index,
+    int64_t dim,
+    const std::optional<at::Tensor>& optional_out,
+    std::optional<int64_t> dim_size) {
+  check_scatter_inputs("scatter_max", src, index);
+  dim = normalize_dim(dim, src.dim(), "scatter_max");
+  if (auto r = maybe_scatter_metal("scatter_max", src, index, dim, optional_out,
+                                   dim_size, /*is_min=*/0u)) {
+    return *r;
+  }
+  return scatter_minmax_fallback(
+      "scatter_max", "amax", src, index, dim, optional_out, dim_size,
+      [&](at::Tensor& out) {
+        AT_DISPATCH_ALL_TYPES_AND2(
+            at::ScalarType::Half, at::ScalarType::BFloat16, out.scalar_type(),
+            "scatter_max_mps_init",
+            [&] { out.fill_(std::numeric_limits<scalar_t>::lowest()); });
+      });
+}
+
+}  // namespace
+
+TORCH_LIBRARY_IMPL(pyg, MPS, m) {
+  m.impl(TORCH_SELECTIVE_NAME("pyg::scatter_min"), TORCH_FN(scatter_min_mps));
+  m.impl(TORCH_SELECTIVE_NAME("pyg::scatter_max"), TORCH_FN(scatter_max_mps));
+}
+
+}  // namespace ops
+}  // namespace pyg
