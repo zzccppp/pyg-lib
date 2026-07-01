@@ -1,5 +1,25 @@
 # pyg-lib
 
+> **macOS / Apple Silicon (MPS) fork.** This branch (`macos-mps-scatter`) adds
+> MPS backend support: native `scatter_sum/mul/mean`, a **fused single-pass
+> Metal kernel** for `scatter_min/max` (value + arg in one 64-bit-atomic pass,
+> arbitrary `dim`/rank, float32/float16/bfloat16), and CPU-assisted shims for
+> point-cloud/spline ops. See the upstream project at
+> [pyg-team/pyg-lib](https://github.com/pyg-team/pyg-lib).
+>
+> **Install on macOS (tested with `uv`):**
+>
+> ```bash
+> git clone -b macos-mps-scatter https://github.com/zzccppp/pyg-lib.git
+> git -C pyg-lib submodule update --init --recursive \
+>     third_party/METIS third_party/parallel-hashmap
+> uv venv --python 3.12
+> uv pip install torch setuptools wheel ninja
+> uv pip install --no-build-isolation ./pyg-lib   # --no-build-isolation is required
+> ```
+>
+> `--recursive` is needed because METIS has a nested `GKlib` submodule.
+
 <div align="center">
 
 [![Docs Status][docs-image]][docs-url]
