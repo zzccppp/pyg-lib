@@ -11,6 +11,7 @@
 
 #include "../scatter.h"
 #include "../segment_coo.h"
+#include "../segment_csr.h"
 #include "../utils.h"
 
 #include <ATen/ATen.h>
@@ -84,6 +85,33 @@ at::Tensor gather_coo_mps(const at::Tensor& src,
   return result;
 }
 
+// out[e, ...] = src[row(e), ...], where row(e) is the CSR row that contains
+// position e. Building the per-position row index (repeat_interleave of the
+// segment lengths) reduces this to a native index_select. Falls back to CPU for
+// a multi-dim indptr.
+at::Tensor gather_csr_mps(const at::Tensor& src,
+                          const at::Tensor& indptr,
+                          const std::optional<at::Tensor>& out) {
+  if (indptr.dim() != 1) {
+    auto res = gather_csr(src.cpu(), indptr.cpu(),
+                          out.has_value()
+                              ? std::optional<at::Tensor>(out->cpu())
+                              : std::nullopt)
+                   .to(src.device());
+    return res;
+  }
+  const int64_t N = indptr.size(0) - 1;
+  auto ip = indptr.contiguous();
+  auto counts = ip.slice(0, 1, N + 1) - ip.slice(0, 0, N);       // [N]
+  auto row = at::arange(N, ip.options()).repeat_interleave(counts);  // [E]
+  auto result = src.index_select(0, row);
+  if (out.has_value()) {
+    out.value().copy_(result);
+    return out.value();
+  }
+  return result;
+}
+
 }  // namespace
 
 TORCH_LIBRARY_IMPL(pyg, MPS, m) {
@@ -96,6 +124,7 @@ TORCH_LIBRARY_IMPL(pyg, MPS, m) {
   m.impl(TORCH_SELECTIVE_NAME("pyg::segment_max_coo"),
          TORCH_FN(segment_max_coo_mps));
   m.impl(TORCH_SELECTIVE_NAME("pyg::gather_coo"), TORCH_FN(gather_coo_mps));
+  m.impl(TORCH_SELECTIVE_NAME("pyg::gather_csr"), TORCH_FN(gather_csr_mps));
 }
 
 }  // namespace ops
