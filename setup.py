@@ -13,7 +13,7 @@ import warnings
 from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
 
-__version__ = '0.8.0'
+__version__ = '0.8.1'
 # Optional local-version suffix (PEP 440), e.g. "+pt212" to encode the PyTorch
 # ABI a wheel was built against. Compiled torch extensions are tied to the torch
 # minor version, so multi-version distributions tag wheels this way (matching
