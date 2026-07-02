@@ -350,6 +350,44 @@ def softmax_csr(
     return torch.ops.pyg.softmax_csr(src, ptr, dim)
 
 
+_SPMM_REDUCE = {'sum': 0, 'add': 0, 'mean': 1, 'max': 2}
+
+
+def spmm_csr(
+    x: Tensor,
+    indptr: Tensor,
+    col: Tensor,
+    weight: Optional[Tensor] = None,
+    reduce: str = 'sum',
+) -> Tensor:
+    r"""Fused sparse-dense aggregation (SpMM) in CSR-by-target layout -- the
+    core neighbor aggregation of a GNN message-passing layer, in a single pass.
+
+    Computes, for each destination node :obj:`i`:
+
+    .. math::
+        \mathrm{out}[i] = \bigoplus_{e \,\in\, [\mathrm{indptr}[i],\,
+        \mathrm{indptr}[i+1])} \mathrm{weight}[e] \cdot x[\mathrm{col}[e]]
+
+    where :math:`\bigoplus` is :obj:`reduce` (``"sum"``, ``"mean"`` or
+    ``"max"``). Unlike the gather + :obj:`scatter_add` path, no :math:`[E, F]`
+    message tensor is materialized and no atomics are used, which is
+    dramatically faster than :obj:`scatter_add` on MPS.
+
+    Args:
+        x: Source node features of shape :obj:`[N_src, F]`.
+        indptr: CSR row pointers of shape :obj:`[N_dst + 1]` (edges grouped by
+            destination node).
+        col: Source node index per edge, shape :obj:`[E]` (``torch.long``).
+        weight: Optional per-edge scalar of shape :obj:`[E]` (e.g. GCN
+            normalization or attention coefficients).
+        reduce: One of :obj:`"sum"`, :obj:`"mean"`, :obj:`"max"`.
+    """
+    if reduce not in _SPMM_REDUCE:
+        raise ValueError(f"spmm_csr: unknown reduce '{reduce}'")
+    return torch.ops.pyg.spmm_csr(x, indptr, col, weight, _SPMM_REDUCE[reduce])
+
+
 def scatter_sum(
     src: Tensor,
     index: Tensor,
@@ -1222,6 +1260,7 @@ __all__ = [
     'sampled_div',
     'index_sort',
     'softmax_csr',
+    'spmm_csr',
     'scatter_sum',
     'scatter_add',
     'scatter_mul',
