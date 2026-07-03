@@ -3,6 +3,7 @@
 #include <torch/library.h>
 
 #include <limits>
+#include <tuple>
 
 namespace pyg {
 namespace ops {
@@ -67,10 +68,68 @@ at::Tensor spmm_csr_kernel(const at::Tensor& x,
   return out;
 }
 
+// out[i, f] = max_e weight[e] * x[col[e], f];  arg[i, f] = col[e*] (first max).
+// Empty rows: value 0, arg = x.size(0).
+std::tuple<at::Tensor, at::Tensor> spmm_max_csr_kernel(
+    const at::Tensor& x,
+    const at::Tensor& indptr,
+    const at::Tensor& col,
+    const std::optional<at::Tensor>& weight) {
+  const auto x_c = x.contiguous();
+  const auto indptr_c = indptr.contiguous();
+  const auto col_c = col.contiguous();
+  const auto N = indptr_c.size(0) - 1;
+  const auto F = x_c.size(1);
+  const int64_t sentinel = x_c.size(0);
+  auto out = at::zeros({N, F}, x_c.options());
+  auto arg = at::full({N, F}, sentinel, indptr_c.options());
+
+  const bool has_w = weight.has_value();
+  const auto w_c = has_w ? weight.value().contiguous() : at::Tensor();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf, at::kBFloat16, x_c.scalar_type(), "spmm_max_csr_kernel", [&] {
+        const auto* ip = indptr_c.data_ptr<int64_t>();
+        const auto* cl = col_c.data_ptr<int64_t>();
+        const auto* xp = x_c.data_ptr<scalar_t>();
+        auto* op = out.data_ptr<scalar_t>();
+        auto* ap = arg.data_ptr<int64_t>();
+        const scalar_t* wp = has_w ? w_c.data_ptr<scalar_t>() : nullptr;
+
+        at::parallel_for(0, N, 1, [&](int64_t beg, int64_t end) {
+          for (int64_t i = beg; i < end; ++i) {
+            const int64_t start = ip[i], stop = ip[i + 1];
+            if (stop <= start)
+              continue;
+            auto* out_row = op + i * F;
+            auto* arg_row = ap + i * F;
+            for (int64_t f = 0; f < F; ++f)
+              out_row[f] = std::numeric_limits<scalar_t>::lowest();
+            for (int64_t e = start; e < stop; ++e) {
+              const int64_t src = cl[e];
+              const auto* x_row = xp + src * F;
+              const scalar_t w = has_w ? wp[e] : scalar_t(1);
+              for (int64_t f = 0; f < F; ++f) {
+                const scalar_t v = w * x_row[f];
+                if (v > out_row[f]) {
+                  out_row[f] = v;
+                  arg_row[f] = src;
+                }
+              }
+            }
+          }
+        });
+      });
+
+  return std::make_tuple(out, arg);
+}
+
 }  // namespace
 
 TORCH_LIBRARY_IMPL(pyg, CPU, m) {
   m.impl(TORCH_SELECTIVE_NAME("pyg::spmm_csr"), TORCH_FN(spmm_csr_kernel));
+  m.impl(TORCH_SELECTIVE_NAME("pyg::spmm_max_csr"),
+         TORCH_FN(spmm_max_csr_kernel));
 }
 
 }  // namespace ops

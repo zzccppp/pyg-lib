@@ -77,12 +77,55 @@ inline void spmm_impl(device const T* x, device const long* indptr,
 SPMM_K(spmm_f32, float)
 SPMM_K(spmm_f16, half)
 SPMM_K(spmm_bf16, ushort)
+
+// Max-reducing SpMM: also emits the winning source node `col[e*]` per cell.
+template <typename T>
+inline void spmm_max_impl(device const T* x, device const long* indptr,
+                          device const long* col, device const T* weight,
+                          device T* out, device long* arg, uint N, uint F,
+                          uint has_w, uint Nsrc, uint gid) {
+    if (gid >= N * F) return;
+    uint i = gid / F;
+    uint f = gid % F;
+    long start = indptr[i], end = indptr[i + 1];
+    if (end <= start) { store_out(out, gid, 0.0f); arg[gid] = (long)Nsrc; return; }
+    float best = -INFINITY;
+    long besti = (long)Nsrc;
+    for (long e = start; e < end; ++e) {
+        long src = col[e];
+        float w = (has_w != 0u) ? to_float(weight[e]) : 1.0f;
+        float v = w * to_float(x[(uint)src * F + f]);
+        if (v > best) { best = v; besti = src; }
+    }
+    store_out(out, gid, best);
+    arg[gid] = besti;
+}
+
+#define SPMM_MAX_K(NAME, T)                                   \
+  kernel void NAME(device const T* x [[buffer(0)]],           \
+                   device const long* indptr [[buffer(1)]],   \
+                   device const long* col [[buffer(2)]],      \
+                   device const T* weight [[buffer(3)]],      \
+                   device T* out [[buffer(4)]],               \
+                   device long* arg [[buffer(5)]],            \
+                   constant uint& N [[buffer(6)]],            \
+                   constant uint& F [[buffer(7)]],            \
+                   constant uint& has_w [[buffer(8)]],        \
+                   constant uint& Nsrc [[buffer(9)]],         \
+                   uint gid [[thread_position_in_grid]]) {    \
+    spmm_max_impl(x, indptr, col, weight, out, arg, N, F, has_w, Nsrc, gid); \
+  }
+
+SPMM_MAX_K(spmm_max_f32, float)
+SPMM_MAX_K(spmm_max_f16, half)
+SPMM_MAX_K(spmm_max_bf16, ushort)
 )METAL";
 
 constexpr int kNumDtypes = 3;
 
 struct MetalSpmm {
   id<MTLComputePipelineState> pso[kNumDtypes] = {nil, nil, nil};
+  id<MTLComputePipelineState> pso_max[kNumDtypes] = {nil, nil, nil};
   bool ok = false;
 };
 
@@ -107,9 +150,12 @@ const MetalSpmm& metal_spmm() {
                          error:&err];
       if (!lib) return s;
       NSString* names[kNumDtypes] = {@"spmm_f32", @"spmm_f16", @"spmm_bf16"};
+      NSString* max_names[kNumDtypes] = {@"spmm_max_f32", @"spmm_max_f16",
+                                         @"spmm_max_bf16"};
       for (int i = 0; i < kNumDtypes; ++i) {
         s.pso[i] = make_pso(dev, lib, names[i]);
-        if (!s.pso[i]) return s;
+        s.pso_max[i] = make_pso(dev, lib, max_names[i]);
+        if (!s.pso[i] || !s.pso_max[i]) return s;
       }
       s.ok = true;
     }
@@ -201,10 +247,67 @@ at::Tensor spmm_csr_mps(const at::Tensor& x, const at::Tensor& indptr,
   return out;
 }
 
+std::tuple<at::Tensor, at::Tensor> spmm_max_csr_cpu_fallback(
+    const at::Tensor& x, const at::Tensor& indptr, const at::Tensor& col,
+    const std::optional<at::Tensor>& weight) {
+  auto w = weight.has_value() ? std::optional<at::Tensor>(weight->cpu())
+                              : std::nullopt;
+  auto r = spmm_max_csr(x.cpu(), indptr.cpu(), col.cpu(), w);
+  return std::make_tuple(std::get<0>(r).to(x.device()),
+                         std::get<1>(r).to(x.device()));
+}
+
+std::tuple<at::Tensor, at::Tensor> spmm_max_csr_mps(
+    const at::Tensor& x, const at::Tensor& indptr, const at::Tensor& col,
+    const std::optional<at::Tensor>& weight) {
+  const int64_t N = indptr.size(0) - 1;
+  if (!spmm_eligible(x, indptr, col, weight, N)) {
+    return spmm_max_csr_cpu_fallback(x, indptr, col, weight);
+  }
+  auto x_c = x.contiguous();
+  auto indptr_c = indptr.contiguous();
+  auto col_c = col.contiguous();
+  const uint32_t Nu = (uint32_t)N;
+  const uint32_t F = (uint32_t)x_c.size(1);
+  const uint32_t has_w = weight.has_value() ? 1u : 0u;
+  const uint32_t Nsrc = (uint32_t)x_c.size(0);
+  auto w_c = weight.has_value() ? weight->contiguous() : x_c;
+
+  auto out = at::empty({N, (int64_t)F}, x_c.options());
+  auto arg = at::empty({N, (int64_t)F}, indptr_c.options());
+  const uint32_t total = Nu * F;
+  auto pso = metal_spmm().pso_max[dtype_index(x_c.scalar_type())];
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = torch::mps::get_command_buffer();
+    dispatch_sync(torch::mps::get_dispatch_queue(), ^{
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pso];
+      [enc setBuffer:mtl_buffer(x_c) offset:byte_offset(x_c) atIndex:0];
+      [enc setBuffer:mtl_buffer(indptr_c) offset:byte_offset(indptr_c) atIndex:1];
+      [enc setBuffer:mtl_buffer(col_c) offset:byte_offset(col_c) atIndex:2];
+      [enc setBuffer:mtl_buffer(w_c) offset:byte_offset(w_c) atIndex:3];
+      [enc setBuffer:mtl_buffer(out) offset:0 atIndex:4];
+      [enc setBuffer:mtl_buffer(arg) offset:0 atIndex:5];
+      [enc setBytes:&Nu length:sizeof(Nu) atIndex:6];
+      [enc setBytes:&F length:sizeof(F) atIndex:7];
+      [enc setBytes:&has_w length:sizeof(has_w) atIndex:8];
+      [enc setBytes:&Nsrc length:sizeof(Nsrc) atIndex:9];
+      NSUInteger tg = MIN((NSUInteger)pso.maxTotalThreadsPerThreadgroup,
+                          (NSUInteger)total);
+      [enc dispatchThreads:MTLSizeMake(total, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(MAX(tg, (NSUInteger)1), 1, 1)];
+      [enc endEncoding];
+      torch::mps::commit();
+    });
+  }
+  return std::make_tuple(out, arg);
+}
+
 }  // namespace
 
 TORCH_LIBRARY_IMPL(pyg, MPS, m) {
   m.impl(TORCH_SELECTIVE_NAME("pyg::spmm_csr"), TORCH_FN(spmm_csr_mps));
+  m.impl(TORCH_SELECTIVE_NAME("pyg::spmm_max_csr"), TORCH_FN(spmm_max_csr_mps));
 }
 
 }  // namespace ops

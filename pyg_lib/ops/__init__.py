@@ -388,6 +388,29 @@ def spmm_csr(
     return torch.ops.pyg.spmm_csr(x, indptr, col, weight, _SPMM_REDUCE[reduce])
 
 
+def spmm_max_csr(
+    x: Tensor,
+    indptr: Tensor,
+    col: Tensor,
+    weight: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor]:
+    r"""Max-reducing fused SpMM aggregation returning ``(out, arg)``.
+
+    Like :func:`spmm_csr` with ``reduce="max"`, but also returns, per output
+    cell :obj:`(i, f)`, the source node :obj:`col[e*]` of the winning edge
+    (first occurrence on ties) so a message-passing layer's backward can route
+    the gradient to exactly that neighbor. Empty rows produce value ``0`` and
+    arg :obj:`x.size(0)`. :obj:`arg` is non-differentiable.
+
+    Args:
+        x: Source node features of shape :obj:`[N_src, F]`.
+        indptr: CSR row pointers of shape :obj:`[N_dst + 1]`.
+        col: Source node index per edge, shape :obj:`[E]` (``torch.long``).
+        weight: Optional per-edge scalar applied to the compared value.
+    """
+    return torch.ops.pyg.spmm_max_csr(x, indptr, col, weight)
+
+
 def scatter_sum(
     src: Tensor,
     index: Tensor,
@@ -1261,6 +1284,7 @@ __all__ = [
     'index_sort',
     'softmax_csr',
     'spmm_csr',
+    'spmm_max_csr',
     'scatter_sum',
     'scatter_add',
     'scatter_mul',
