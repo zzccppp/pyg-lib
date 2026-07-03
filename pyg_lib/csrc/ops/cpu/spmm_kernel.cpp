@@ -124,12 +124,45 @@ std::tuple<at::Tensor, at::Tensor> spmm_max_csr_kernel(
   return std::make_tuple(out, arg);
 }
 
+// grad_x[arg[i, f], f] += grad_out[i, f] for arg[i, f] < num_src. Parallelized
+// over feature columns, which never collide with each other.
+at::Tensor spmm_max_csr_bw_kernel(const at::Tensor& grad_out,
+                                  const at::Tensor& arg,
+                                  const int64_t num_src) {
+  const auto grad_c = grad_out.contiguous();
+  const auto arg_c = arg.contiguous();
+  const auto N = grad_c.size(0);
+  const auto F = grad_c.size(1);
+  auto grad_x = at::zeros({num_src, F}, grad_c.options());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf, at::kBFloat16, grad_c.scalar_type(), "spmm_max_csr_bw_kernel",
+      [&] {
+        const auto* gp = grad_c.data_ptr<scalar_t>();
+        const auto* ap = arg_c.data_ptr<int64_t>();
+        auto* xp = grad_x.data_ptr<scalar_t>();
+        at::parallel_for(0, F, 1, [&](int64_t fbeg, int64_t fend) {
+          for (int64_t f = fbeg; f < fend; ++f) {
+            for (int64_t i = 0; i < N; ++i) {
+              const int64_t a = ap[i * F + f];
+              if (a < num_src)
+                xp[a * F + f] += gp[i * F + f];
+            }
+          }
+        });
+      });
+
+  return grad_x;
+}
+
 }  // namespace
 
 TORCH_LIBRARY_IMPL(pyg, CPU, m) {
   m.impl(TORCH_SELECTIVE_NAME("pyg::spmm_csr"), TORCH_FN(spmm_csr_kernel));
   m.impl(TORCH_SELECTIVE_NAME("pyg::spmm_max_csr"),
          TORCH_FN(spmm_max_csr_kernel));
+  m.impl(TORCH_SELECTIVE_NAME("pyg::spmm_max_csr_bw"),
+         TORCH_FN(spmm_max_csr_bw_kernel));
 }
 
 }  // namespace ops

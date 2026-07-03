@@ -39,6 +39,16 @@ inline void store_out(device float* p, uint i, float v)  { p[i] = v; }
 inline void store_out(device half* p, uint i, float v)   { p[i] = half(v); }
 inline void store_out(device ushort* p, uint i, float v) { p[i] = ushort(as_type<uint>(v) >> 16); }
 
+// Portable atomic float add via compare-exchange on the underlying uint bits.
+inline void atomic_add_float(device atomic_uint* addr, float val) {
+    uint expected = atomic_load_explicit(addr, memory_order_relaxed);
+    uint desired;
+    do {
+        desired = as_type<uint>(as_type<float>(expected) + val);
+    } while (!atomic_compare_exchange_weak_explicit(
+        addr, &expected, desired, memory_order_relaxed, memory_order_relaxed));
+}
+
 // reduce: 0=sum, 1=mean, 2=max
 template <typename T>
 inline void spmm_impl(device const T* x, device const long* indptr,
@@ -119,6 +129,21 @@ inline void spmm_max_impl(device const T* x, device const long* indptr,
 SPMM_MAX_K(spmm_max_f32, float)
 SPMM_MAX_K(spmm_max_f16, half)
 SPMM_MAX_K(spmm_max_bf16, ushort)
+
+// Backward of max SpMM: grad_x[arg[gid], f] += grad_out[gid] (atomic, f32).
+kernel void spmm_max_bw_f32(device const float* grad_out [[buffer(0)]],
+                            device const long* arg [[buffer(1)]],
+                            device atomic_uint* grad_x [[buffer(2)]],
+                            constant uint& N [[buffer(3)]],
+                            constant uint& F [[buffer(4)]],
+                            constant uint& num_src [[buffer(5)]],
+                            uint gid [[thread_position_in_grid]]) {
+    if (gid >= N * F) return;
+    long a = arg[gid];
+    if (a >= (long)num_src) return;
+    uint f = gid % F;
+    atomic_add_float(&grad_x[(uint)a * F + f], grad_out[gid]);
+}
 )METAL";
 
 constexpr int kNumDtypes = 3;
@@ -126,6 +151,7 @@ constexpr int kNumDtypes = 3;
 struct MetalSpmm {
   id<MTLComputePipelineState> pso[kNumDtypes] = {nil, nil, nil};
   id<MTLComputePipelineState> pso_max[kNumDtypes] = {nil, nil, nil};
+  id<MTLComputePipelineState> pso_bw = nil;  // f32 only (atomic add)
   bool ok = false;
 };
 
@@ -157,6 +183,8 @@ const MetalSpmm& metal_spmm() {
         s.pso_max[i] = make_pso(dev, lib, max_names[i]);
         if (!s.pso[i] || !s.pso_max[i]) return s;
       }
+      s.pso_bw = make_pso(dev, lib, @"spmm_max_bw_f32");
+      if (!s.pso_bw) return s;
       s.ok = true;
     }
     return s;
@@ -303,11 +331,53 @@ std::tuple<at::Tensor, at::Tensor> spmm_max_csr_mps(
   return std::make_tuple(out, arg);
 }
 
+at::Tensor spmm_max_csr_bw_mps(const at::Tensor& grad_out, const at::Tensor& arg,
+                              const int64_t num_src) {
+  const int64_t u32 = std::numeric_limits<uint32_t>::max();
+  const bool eligible = metal_spmm().ok &&
+                        grad_out.scalar_type() == at::kFloat &&
+                        arg.scalar_type() == at::kLong &&
+                        grad_out.numel() <= u32 && num_src * grad_out.size(1) <= u32;
+  if (!eligible) {
+    return spmm_max_csr_bw(grad_out.cpu(), arg.cpu(), num_src).to(grad_out.device());
+  }
+  auto grad_c = grad_out.contiguous();
+  auto arg_c = arg.contiguous();
+  const uint32_t N = (uint32_t)grad_c.size(0);
+  const uint32_t F = (uint32_t)grad_c.size(1);
+  const uint32_t Ns = (uint32_t)num_src;
+  auto grad_x = at::zeros({num_src, (int64_t)F}, grad_c.options());
+  const uint32_t total = N * F;
+  auto pso = metal_spmm().pso_bw;
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = torch::mps::get_command_buffer();
+    dispatch_sync(torch::mps::get_dispatch_queue(), ^{
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pso];
+      [enc setBuffer:mtl_buffer(grad_c) offset:byte_offset(grad_c) atIndex:0];
+      [enc setBuffer:mtl_buffer(arg_c) offset:byte_offset(arg_c) atIndex:1];
+      [enc setBuffer:mtl_buffer(grad_x) offset:0 atIndex:2];
+      [enc setBytes:&N length:sizeof(N) atIndex:3];
+      [enc setBytes:&F length:sizeof(F) atIndex:4];
+      [enc setBytes:&Ns length:sizeof(Ns) atIndex:5];
+      NSUInteger tg = MIN((NSUInteger)pso.maxTotalThreadsPerThreadgroup,
+                          (NSUInteger)total);
+      [enc dispatchThreads:MTLSizeMake(total, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(MAX(tg, (NSUInteger)1), 1, 1)];
+      [enc endEncoding];
+      torch::mps::commit();
+    });
+  }
+  return grad_x;
+}
+
 }  // namespace
 
 TORCH_LIBRARY_IMPL(pyg, MPS, m) {
   m.impl(TORCH_SELECTIVE_NAME("pyg::spmm_csr"), TORCH_FN(spmm_csr_mps));
   m.impl(TORCH_SELECTIVE_NAME("pyg::spmm_max_csr"), TORCH_FN(spmm_max_csr_mps));
+  m.impl(TORCH_SELECTIVE_NAME("pyg::spmm_max_csr_bw"),
+         TORCH_FN(spmm_max_csr_bw_mps));
 }
 
 }  // namespace ops

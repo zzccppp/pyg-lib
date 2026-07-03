@@ -68,6 +68,28 @@ PYG_API std::tuple<at::Tensor, at::Tensor> spmm_max_csr(
   return op.call(x, indptr, col, weight);
 }
 
+// Backward of spmm_max_csr. See spmm.h for the full contract.
+PYG_API at::Tensor spmm_max_csr_bw(const at::Tensor& grad_out,
+                                   const at::Tensor& arg,
+                                   const int64_t num_src) {
+  at::TensorArg grad_arg{grad_out, "grad_out", 0};
+  at::TensorArg arg_arg{arg, "arg", 1};
+  at::CheckedFrom c{"spmm_max_csr_bw"};
+
+  at::checkAllDefined(c, {grad_arg, arg_arg});
+  at::checkDim(c, grad_arg, 2);
+  at::checkDim(c, arg_arg, 2);
+  at::checkSameSize(c, grad_arg, arg_arg);
+  TORCH_CHECK(num_src >= 0, "spmm_max_csr_bw: num_src must be >= 0");
+  TORCH_CHECK(grad_out.device() == arg.device(),
+              "spmm_max_csr_bw: grad_out and arg must be on the same device");
+
+  static auto op = c10::Dispatcher::singleton()
+                       .findSchemaOrThrow("pyg::spmm_max_csr_bw", "")
+                       .typed<decltype(spmm_max_csr_bw)>();
+  return op.call(grad_out, arg, num_src);
+}
+
 TORCH_LIBRARY_FRAGMENT(pyg, m) {
   m.def(TORCH_SELECTIVE_SCHEMA(
       "pyg::spmm_csr(Tensor x, Tensor indptr, Tensor col, Tensor? weight, "
@@ -75,6 +97,9 @@ TORCH_LIBRARY_FRAGMENT(pyg, m) {
   m.def(TORCH_SELECTIVE_SCHEMA(
       "pyg::spmm_max_csr(Tensor x, Tensor indptr, Tensor col, Tensor? weight) "
       "-> (Tensor, Tensor)"));
+  m.def(TORCH_SELECTIVE_SCHEMA(
+      "pyg::spmm_max_csr_bw(Tensor grad_out, Tensor arg, int num_src) "
+      "-> Tensor"));
 }
 
 }  // namespace ops

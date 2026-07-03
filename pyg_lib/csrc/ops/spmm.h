@@ -51,5 +51,21 @@ PYG_API std::tuple<at::Tensor, at::Tensor> spmm_max_csr(
     const at::Tensor& col,
     const std::optional<at::Tensor>& weight);
 
+// Backward of `spmm_max_csr`: routes each output cell's gradient to the source
+// node that won its max. Computes
+//
+//   grad_x[arg[i, f], f] += grad_out[i, f]   for all arg[i, f] < num_src
+//
+// (cells with the empty-row sentinel `arg == num_src` contribute nothing).
+// The scatter has index collisions (several output cells may share a winning
+// source), so the MPS kernel uses an atomic add; unlike a plain `scatter_add`
+// this stays on-device and avoids the pathological MPS `scatter_add` path.
+//
+// `grad_out` and `arg` are `[N_dst, F]`; returns `grad_x` shaped
+// `[num_src, F]`.
+PYG_API at::Tensor spmm_max_csr_bw(const at::Tensor& grad_out,
+                                   const at::Tensor& arg,
+                                   const int64_t num_src);
+
 }  // namespace ops
 }  // namespace pyg

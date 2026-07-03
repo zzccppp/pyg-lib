@@ -411,6 +411,27 @@ def spmm_max_csr(
     return torch.ops.pyg.spmm_max_csr(x, indptr, col, weight)
 
 
+def spmm_max_csr_bw(
+    grad_out: Tensor,
+    arg: Tensor,
+    num_src: int,
+) -> Tensor:
+    r"""Backward of :func:`spmm_max_csr`: fused atomic scatter of the gradient.
+
+    Computes ``grad_x[arg[i, f], f] += grad_out[i, f]`` for every
+    ``arg[i, f] < num_src`` (empty-row sentinels are skipped), routing each
+    output cell's gradient to the neighbor that won its max. The MPS kernel uses
+    an atomic add, avoiding the slow ``scatter_add`` path.
+
+    Args:
+        grad_out: Upstream gradient of shape :obj:`[N_dst, F]`.
+        arg: Winning source node per cell from :func:`spmm_max_csr`, shape
+            :obj:`[N_dst, F]` (``torch.long``).
+        num_src: Number of source rows (output size along dim 0).
+    """
+    return torch.ops.pyg.spmm_max_csr_bw(grad_out, arg, num_src)
+
+
 def scatter_sum(
     src: Tensor,
     index: Tensor,
@@ -1285,6 +1306,7 @@ __all__ = [
     'softmax_csr',
     'spmm_csr',
     'spmm_max_csr',
+    'spmm_max_csr_bw',
     'scatter_sum',
     'scatter_add',
     'scatter_mul',
